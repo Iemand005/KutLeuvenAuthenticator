@@ -94,29 +94,45 @@ func main() {
 	}
 
 	// Try documented pj8 schedule variants for the key, then decrypt field 4
-	// under both nonce guesses (seq 0, all-zero) and additional-data guesses.
+	// under a matrix of nonce and additional-data guesses.
 	privBytes := priv.PrivateKeyBytes()
 	seeds := map[string][]byte{
-		"priv32":  privBytes,
-		"pub32":   pub,
-		"srvPub":  serverPub,
-		"shared":  shared,
-		"zero":    make([]byte, 32),
+		"priv32": privBytes,
+		"pub32":  pub,
+		"srvPub": serverPub,
+		"shared": shared,
+		"zero":   make([]byte, 32),
 	}
 	roles := map[string]byte{"init(1)": 1, "resp(0)": 0}
+
 	nonces := map[string][]byte{
-		"seq0":  sigmai.NonceFromSeq(0),
-		"zero":  make([]byte, 24),
+		"seq0":   sigmai.NonceFromSeq(0),
+		"zero":   make([]byte, 24),
+		"ct0:24": ct[:24],
+	}
+	ads := map[string][]byte{
+		"nil":  nil,
+		"f10":  reply.F10,
+		"f2":   reply.F2,
+		"zero": make([]byte, 0),
 	}
 
 	for sname, seed := range seeds {
 		for rname, role := range roles {
 			key := pj8(privBytes, serverPub, shared, seed, role)
-			log.Printf("key[seed=%s role=%s] = %x", sname, rname, key)
 			for nname, nonce := range nonces {
-				pt, err := sigmai.Open(key[:], nonce, ct, nil)
-				if err == nil {
-					log.Printf("  *** DECRYPT OK [%s/%s/%s]: %x (%q)", sname, rname, nname, pt, string(pt))
+				for aname, ad := range ads {
+					pt, err := sigmai.Open(key, nonce, ct, ad)
+					if err == nil {
+						log.Printf("*** OK key[%s/%s] nonce[%s] ad[%s]: %x %q", sname, rname, nname, aname, pt, string(pt))
+					}
+					// Also try ct[24:] with nonce = ct[:24].
+					if nname == "ct0:24" && len(ct) > 24 {
+						pt2, err2 := sigmai.Open(key, ct[:24], ct[24:], ad)
+						if err2 == nil {
+							log.Printf("*** OK(nonce-in-ct) key[%s/%s] ad[%s]: %x %q", sname, rname, aname, pt2, string(pt2))
+						}
+					}
 				}
 			}
 		}
