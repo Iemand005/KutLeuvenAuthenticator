@@ -39,6 +39,9 @@ type Config struct {
 // Conn wraps a gorilla websocket connection.
 type Conn struct {
 	*websocket.Conn
+
+	// Handshake records the HTTP upgrade response, if captured.
+	Handshake *http.Response
 }
 
 var defaultDialer = websocket.Dialer{
@@ -85,7 +88,44 @@ func Dial(rawURL string, cfg *Config) (*Conn, error) {
 		}
 		return nil, fmt.Errorf("transport: dial: %w", err)
 	}
-	return &Conn{Conn: c}, nil
+	return &Conn{Conn: c, Handshake: resp}, nil
+}
+
+// DialRaw opens a WebSocket, returning the upgrade response even on failure, so
+// callers can inspect the server's HTTP status and headers.
+func DialRaw(rawURL string, cfg *Config) (*Conn, *http.Response, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("transport: malformed ws or wss URL: %w", err)
+	}
+	if u.Scheme != "wss" {
+		return nil, nil, fmt.Errorf("transport: scheme must be wss, got %q", u.Scheme)
+	}
+	d := defaultDialer
+	if cfg != nil {
+		if cfg.RootCAs != nil || cfg.TLSConfig != nil {
+			tc := cfg.TLSConfig
+			if tc == nil {
+				tc = &tls.Config{RootCAs: cfg.RootCAs, MinVersion: tls.VersionTLS12}
+			}
+			d.TLSClientConfig = tc
+		}
+		if cfg.HandshakeTimeout > 0 {
+			d.HandshakeTimeout = cfg.HandshakeTimeout
+		}
+		if cfg.Subprotocols != nil {
+			d.Subprotocols = cfg.Subprotocols
+		}
+	}
+	var hdr http.Header
+	if cfg != nil {
+		hdr = cfg.Headers
+	}
+	c, resp, err := d.Dial(rawURL, hdr)
+	if err != nil {
+		return nil, resp, err
+	}
+	return &Conn{Conn: c, Handshake: resp}, resp, nil
 }
 
 // ReadMessage reads the next binary/text message payload.
