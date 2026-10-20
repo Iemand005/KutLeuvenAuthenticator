@@ -20,12 +20,20 @@ import (
 //	sj8  (0x5ab4d4) : derive a 24-byte nonce from the frame sequence number
 //	oz8/tD8         : XChaCha20-Poly1305 open/seal
 //
-// Key schedule (pj8(priv, peerPub, role)):
-//  1. salt = HMAC-SHA256(keySeed = first 32B of priv, msg = first 32B of priv)
-//  2. shared = X25519(priv, peerPub)
-//  3. block = shared || salt        (role != 0, initiator)
-//     block = salt   || shared      (role == 0, responder)
-//  4. key = SHA-512(first 32 bytes derived) -> 32-byte session key
+// Key schedule (pj8(priv, peerPub, role) @ 0x5aaedc, decompiled):
+//  1. seed  = first 32 bytes of the schedule input (KDF seed / pre-shared secret)
+//  2. salt  = HMAC-SHA256(key = seed, msg = seed)   (hj8 @ 0x5a7b24)
+//  3. shared = X25519(priv, peerPub)                (iD8 @ 0x5a7d6c)
+//  4. block = shared || salt   (role != 0, initiator)
+//     block = salt   || shared (role == 0, responder)
+//  5. key = SHA-512(block)[:32]                     (pCo @ 0x4a3050)
+//
+// OPEN (DOCUMENTATION.md §8): from the decompilation, the same argument feeds
+// both the salt (step 1) and the X25519 scalar (step 3), which makes the salt
+// depend on a *local* secret and would prevent the peers from agreeing. Either
+// the input is a negotiated session secret shared by both peers, or the two
+// arguments differ. Therefore DeriveKey takes an explicit `seed` the caller must
+// supply from the handshake; pass the agreed session secret there.
 type Crypto struct {
 	priv *ecdh.PrivateKey
 	role byte
@@ -80,11 +88,16 @@ func (c *Crypto) SharedSecret(peerPub []byte) ([]byte, error) {
 }
 
 // DeriveKey computes the 32-byte session key from the peer's public key,
-// following pj8. `seed` is the 32-byte local key material used for the salt;
-// pass nil to use the private scalar's first 32 bytes.
+// following pj8. `seed` is the 32-byte KDF seed / pre-shared session secret
+// agreed during the handshake (see the open item above); it must be identical
+// on both peers for the derived keys to match. Pass nil to fall back to the
+// local private scalar (only valid for same-process tests).
 func (c *Crypto) DeriveKey(peerPub []byte, seed []byte) ([]byte, error) {
 	if seed == nil {
 		seed = c.PrivateKeyBytes()
+	}
+	if len(seed) < 32 {
+		return nil, fmt.Errorf("sigmai: seed must be at least 32 bytes")
 	}
 	salt := hmacSHA256(seed[:32], seed[:32])
 	shared, err := c.SharedSecret(peerPub)
