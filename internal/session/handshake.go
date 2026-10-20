@@ -28,9 +28,14 @@ func (s *Session) Handshake() (*HandshakeResult, error) {
 	}
 	priv.SetRole(1) // initiator
 
-	// 1+2: send our ephemeral public key.
+	// 1+2: send our ephemeral public key (field 2) and a KDF seed (field 4).
+	seed, err := RandomNonce(32)
+	if err != nil {
+		return nil, err
+	}
 	hello := sigmai.NewTyped(sigmai.TypeHeader)
 	hello.F2 = priv.PublicKey()
+	hello.F4 = seed
 	if err := s.conn.WriteBinary(hello.Marshal()); err != nil {
 		return nil, fmt.Errorf("sigmai: send hello: %w", err)
 	}
@@ -49,10 +54,10 @@ func (s *Session) Handshake() (*HandshakeResult, error) {
 		return nil, fmt.Errorf("sigmai: server public key not 32 bytes (field 2 len=%d)", len(peerPub))
 	}
 
-	// 4: derive directional keys. The native pj8 is invoked per direction with a
-	// role flag; attackers cannot distinguish keys without the capture, so we
-	// derive both orderings and expose them for validation.
-	keyA, err := priv.DeriveKey(peerPub, nil)
+	// 4: derive directional keys. The pj8 salt source is not yet byte-verified,
+	// so we seed both sides with a 32-byte value exchanged in the hello frame
+	// (field 4) and derive both role orderings for validation.
+	keyA, err := priv.DeriveKey(peerPub, seed)
 	if err != nil {
 		return nil, err
 	}
@@ -60,7 +65,7 @@ func (s *Session) Handshake() (*HandshakeResult, error) {
 	// The responder-order key (role=0) is derived from a fresh schedule.
 	resp := *priv
 	resp.SetRole(0)
-	keyB, err := resp.DeriveKey(peerPub, nil)
+	keyB, err := resp.DeriveKey(peerPub, seed)
 	if err != nil {
 		return nil, err
 	}
@@ -71,6 +76,7 @@ func (s *Session) Handshake() (*HandshakeResult, error) {
 	return &HandshakeResult{
 		EphemeralPub: priv.PublicKey(),
 		ServerPub:    peerPub,
+		Seed:         seed,
 		KeyInitiator: keyA,
 		KeyResponder: keyB,
 	}, nil
@@ -80,6 +86,7 @@ func (s *Session) Handshake() (*HandshakeResult, error) {
 type HandshakeResult struct {
 	EphemeralPub []byte
 	ServerPub    []byte
+	Seed         []byte
 	KeyInitiator []byte
 	KeyResponder []byte
 }
