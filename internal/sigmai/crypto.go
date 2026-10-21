@@ -12,28 +12,30 @@ import (
 )
 
 // Crypto implements the sigmai key schedule and AEAD, mirroring the native
-// functions:
+// functions (all re-decompiled with IDA 9.4 / Hex-Rays):
 //
-//	pj8  (0x5aaedc) : key schedule  -> X25519 + HMAC-SHA256 salt + SHA-512 expand
-//	iD8  (0x5a7d6c) : X25519 shared secret
-//	hT8/uEc         : X25519 public key from scalar
+//	pj8  (0x5aaedc) : session key schedule -> X25519 + SHA-512 expansion
+//	hj8  (0x5a7b24) : X25519 base mult (public key from private scalar)
+//	iCg  (0x48bf4c) : crypto/ecdh X25519 NewPrivateKey(scalar)   [NewPublicKey in iSg]
+//	iD8  (0x5a7d6c) : X25519 ECDH(priv, peerPub) -> shared secret
 //	sj8  (0x5ab4d4) : derive a 24-byte nonce from the frame sequence number
-//	oz8/tD8         : XChaCha20-Poly1305 open/seal
+//	oz8  (0x5aaa30) : XChaCha20-Poly1305 AEAD open  (nj8 = HChaCha20 subkey)
+//	tD8  (0x5ab7dc) : thin wrapper -> oz8(key, nonce, ct)
+//	4EM  (0x5f21fc) : inbound frame handler: seq = field 3, ct = field 4
 //
-// Key schedule (pj8(priv, peerPub, role) @ 0x5aaedc, decompiled):
-//  1. seed  = first 32 bytes of the schedule input (KDF seed / pre-shared secret)
-//  2. salt  = HMAC-SHA256(key = seed, msg = seed)   (hj8 @ 0x5a7b24)
-//  3. shared = X25519(priv, peerPub)                (iD8 @ 0x5a7d6c)
-//  4. block = shared || salt   (role != 0, initiator)
-//     block = salt   || shared (role == 0, responder)
-//  5. key = SHA-512(block)[:32]                     (pCo @ 0x4a3050)
+// Key schedule (pj8(priv, peerPub, role) @ 0x5aaedc):
+//  1. v26 = first 32 bytes of a1 (our private scalar)
+//  2. v24 = hj8(v26) = X25519 base mult  -> OUR public key
+//  3. shared = iD8(priv=a1, peerPub=a2)  -> X25519 ECDH shared secret
+//  4. block = shared || v30 || v31, where the two pubkeys are ordered so both
+//     peers converge on:  block = shared || CLIENT_pub || SERVER_pub
+//         role == 0 (client) : shared || my_pub   || peer_pub
+//         role != 0 (server) : shared || peer_pub || my_pub
+//  5. key = SHA-512(block)[:32]
 //
-// OPEN (DOCUMENTATION.md §8): from the decompilation, the same argument feeds
-// both the salt (step 1) and the X25519 scalar (step 3), which makes the salt
-// depend on a *local* secret and would prevent the peers from agreeing. Either
-// the input is a negotiated session secret shared by both peers, or the two
-// arguments differ. Therefore DeriveKey takes an explicit `seed` the caller must
-// supply from the handshake; pass the agreed session secret there.
+// Because the ordering makes both peers hash the SAME 96-byte block
+// (shared || client_pub || server_pub), the client only ever needs its own
+// private key and the peer's public key; role is implicit by who is calling.
 type Crypto struct {
 	priv *ecdh.PrivateKey
 	role byte
@@ -88,30 +90,28 @@ func (c *Crypto) SharedSecret(peerPub []byte) ([]byte, error) {
 }
 
 // DeriveKey computes the 32-byte session key from the peer's public key,
-// following pj8. `seed` is the 32-byte KDF seed / pre-shared session secret
-// agreed during the handshake (see the open item above); it must be identical
-// on both peers for the derived keys to match. Pass nil to fall back to the
-// local private scalar (only valid for same-process tests).
-func (c *Crypto) DeriveKey(peerPub []byte, seed []byte) ([]byte, error) {
-	if seed == nil {
-		seed = c.PrivateKeyBytes()
-	}
-	if len(seed) < 32 {
-		return nil, fmt.Errorf("sigmai: seed must be at least 32 bytes")
-	}
-	salt := hmacSHA256(seed[:32], seed[:32])
+// following pj8. The block is SHA-512(shared || client_pub || server_pub)[:32],
+// where role orders the two public keys so both peers hash the same bytes:
+//
+//	role == 0 (client): shared || my_pub   || peer_pub
+//	role != 0 (server): shared || peer_pub || my_pub
+//
+// No KDF seed is involved; the shared secret is X25519(priv, peerPub).
+func (c *Crypto) DeriveKey(peerPub []byte) ([]byte, error) {
 	shared, err := c.SharedSecret(peerPub)
 	if err != nil {
 		return nil, err
 	}
+	mine := c.PublicKey()
 
-	block := make([]byte, 0, 64)
+	block := make([]byte, 0, 96)
+	block = append(block, shared...)
 	if c.role != 0 {
-		block = append(block, shared...)
-		block = append(block, salt...)
+		block = append(block, peerPub...)
+		block = append(block, mine...)
 	} else {
-		block = append(block, salt...)
-		block = append(block, shared...)
+		block = append(block, mine...)
+		block = append(block, peerPub...)
 	}
 	sum := sha512.Sum512(block)
 	return sum[:32], nil

@@ -9,6 +9,7 @@
 package main
 
 import (
+	"crypto/ecdh"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/sha512"
@@ -18,6 +19,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -91,83 +94,94 @@ func main() {
 	priv, _ := hex.DecodeString(cap.Priv)
 	serverPub, _ := hex.DecodeString(cap.ServerPub)
 	ct, _ := hex.DecodeString(cap.Field4)
-	f10, _ := hex.DecodeString(cap.Field10)
 	pub, _ := hex.DecodeString(cap.Pub)
+	seq := uint64(cap.F3)
 
 	cr, _ := sigmai.NewKeyPairFromSeed(priv)
 	shared, _ := cr.SharedSecret(serverPub)
 	log.Printf("shared=%x", shared)
 	log.Printf("ct(%d)=%x", len(ct), ct)
+	log.Printf("seq=%d", seq)
 
-	// Candidate 32-byte keys.
-	keys := map[string][]byte{
-		"raw-shared":   shared,
-		"sha256-sh":    sha256sum(shared),
-		"sha512-sh32":  sha512sum(shared)[:32],
-		"priv32":       priv,
-		"sha256-priv":  sha256sum(priv),
-		"sha256-srv":   sha256sum(serverPub),
-		"sha256-pub":   sha256sum(pub),
-		"hmac-priv":    hmacf(priv, priv),
-		"hmac-shared":  hmacf(shared, shared),
+	// --- Exhaustive pj8 block search: SHA-512(perm of 3 parts)[:32],
+	// plus SHA-256, plus 2-part variants. Parts include raw shared, pubkeys,
+	// the base-mult of priv (== pub), the base-mult of shared, and priv. ---
+	baseOfShared, _ := x25519Base(shared)
+	baseOfPriv, _ := x25519Base(priv)
+	partset := map[string][]byte{
+		"shared":   shared,
+		"pub":      pub,
+		"srv":      serverPub,
+		"priv":     priv,
+		"bSh":      baseOfShared, // X25519_base(shared)
+		"bPriv":    baseOfPriv,   // == pub
+		"sha256sh": sha256sum(shared),
 	}
-	// pj8-style derived keys: SHA-512(block)[:32] for many block orders (2 and 3 parts).
-	parts := map[string][]byte{
-		"shared": shared, "priv": priv, "srv": serverPub, "pub": pub,
-		"salt": hmacf(priv, priv), "salt2": hmacf(priv, priv),
-		"saltSh": hmacf(shared, shared),
+	// Nonce candidates (all 24 bytes unless noted).
+	nonces := map[string][]byte{}
+	mkFront := func(w int, be bool) []byte {
+		n := make([]byte, 24)
+		for i := 0; i < w; i++ {
+			if be {
+				n[w-1-i] = byte(seq >> (8 * i))
+			} else {
+				n[i] = byte(seq >> (8 * i))
+			}
+		}
+		return n
 	}
-	for pn, p := range parts {
-		keys["sha512("+pn+")"] = sha512sum(p)[:32]
-		keys["hmac(priv,"+pn+")"] = hmacf(priv, p)
-		keys["hmac("+pn+",priv)"] = hmacf(p, priv)
+	nonces["le64_front"] = mkFront(8, false)
+	nonces["be64_front"] = mkFront(8, true)
+	nonces["le32_front"] = mkFront(4, false)
+	nonces["be32_front"] = mkFront(4, true)
+	nonces["le16_front"] = mkFront(2, false)
+	nonces["zero24"] = make([]byte, 24)
+
+	pkeys, pnames := []string{}, []string{}
+	for k := range partset {
+		pnames = append(pnames, k)
 	}
-	// 2-part and 3-part concatenations.
-	names := []string{"shared", "priv", "srv", "pub", "salt", "saltSh"}
-	for _, a := range names {
-		for _, b := range names {
-			keys["sha512("+a+"|"+b+")"] = sha512sum(concat(parts[a], parts[b]))[:32]
-			for _, c := range names {
-				keys["sha512("+a+"|"+b+"|"+c+")"] = sha512sum(concat(parts[a], parts[b], parts[c]))[:32]
+	sort.Strings(pnames)
+	// all ordered triples (with repetition) of distinct part names
+	for _, a := range pnames {
+		for _, b := range pnames {
+			for _, c := range pnames {
+				if a == b || b == c || a == c {
+					continue
+				}
+				pkeys = append(pkeys, a+"|"+b+"|"+c)
 			}
 		}
 	}
-	log.Printf("candidate keys: %d", len(keys))
-
-	// AEAD variants: full field4 as ct+tag with external nonce; or 12-byte nonce prefix.
-	nonceSet := map[string][]byte{
-		"zero24": make([]byte, 24), "zero12": make([]byte, 12),
-		"srv-nonce?" : make([]byte, 24),
-	}
-	ads := map[string][]byte{"nil": nil, "f10": f10, "srv": serverPub}
+	log.Printf("ordered triples: %d", len(pkeys))
 
 	hits := 0
-	for kn, key := range keys {
-		for nname, nonce := range nonceSet {
-			for aname, ad := range ads {
-				// XChaCha20-Poly1305, ct = field4
-				tryOpen(kn, nname, aname, key, nonce, ct, ad, func(pt []byte) {
-					log.Printf("*** X OK key=%s nonce=%s ad=%s pt=%x %q", kn, nname, aname, pt, string(pt))
-					hits++
-				})
-			}
-		}
-		// IETF ChaCha20-Poly1305: nonce = ct[:12], body = ct[12:]
-		if len(ct) > 12 {
-			tryOpenIETF(kn, key, ct[:12], ct[12:], nil, func(pt []byte) {
-				log.Printf("*** IETF OK key=%s nonce=ct[:12] pt=%x %q", kn, pt, string(pt))
-				hits++
-			})
-		}
-		// 24-byte nonce prefix variant
-		if len(ct) > 24 {
-			tryOpen(kn, "ct[:24]", "nil", key, ct[:24], ct[24:], nil, func(pt []byte) {
-				log.Printf("*** X(nonce=ct[:24]) OK key=%s pt=%x %q", kn, pt, string(pt))
+	tryKey := func(kname string, key []byte) {
+		for nname, nonce := range nonces {
+			tryOpen(kname, nname, "nil", key, nonce, ct, nil, func(pt []byte) {
+				log.Printf("*** X OK key=%s nonce=%s pt(%d)=%x %q", kname, nname, len(pt), pt, string(pt))
 				hits++
 			})
 		}
 	}
-	log.Printf("done, %d hits", hits)
+	for _, t := range pkeys {
+		parts := strings.Split(t, "|")
+		block := concat(partset[parts[0]], partset[parts[1]], partset[parts[2]])
+		tryKey("sha512("+t+")[:32]", sha512sum(block)[:32])
+	}
+	// 2-part and single-part for good measure
+	for _, a := range pnames {
+		tryKey("sha512("+a+")[:32]", sha512sum(partset[a])[:32])
+		for _, b := range pnames {
+			tryKey("sha512("+a+"|"+b+")[:32]", sha512sum(concat(partset[a], partset[b]))[:32])
+			tryKey("sha256("+a+"|"+b+")", sha256sum(concat(partset[a], partset[b])))
+		}
+	}
+	log.Printf("exhaustive block search done, %d hits", hits)
+	if hits > 0 {
+		return
+	}
+	log.Printf("no hits; primary key was sha512(shared|pub|srv)[:32]")
 }
 
 func tryOpen(kn, nname, aname string, key, nonce, ct, ad []byte, ok func([]byte)) {
@@ -175,7 +189,11 @@ func tryOpen(kn, nname, aname string, key, nonce, ct, ad []byte, ok func([]byte)
 	if err != nil {
 		return
 	}
-	if pt, err := aead.Open(nil, nonce, ct, ad); err == nil {
+	// Native lays the 16-byte Poly1305 tag FIRST (oz8 reads ct[16:] as the
+	// ciphertext and ct[:16] as the tag). Go's AEAD expects tag-suffix, so
+	// reorder before opening.
+	reordered := append(append([]byte{}, ct[16:]...), ct[:16]...)
+	if pt, err := aead.Open(nil, nonce, reordered, ad); err == nil {
 		ok(pt)
 	}
 }
@@ -197,12 +215,24 @@ func concat(bs ...[]byte) []byte {
 	}
 	return o
 }
+
 func sha256sum(b []byte) []byte { s := sha256.Sum256(b); return s[:] }
 func sha512sum(b []byte) []byte { s := sha512.Sum512(b); return s[:] }
+
 func hmacf(key, msg []byte) []byte {
 	m := hmac.New(sha256.New, key)
 	m.Write(msg)
 	return m.Sum(nil)
+}
+
+// x25519Base computes X25519_base(scalar) = the public key for a private scalar
+// (mirrors hj8 @ 0x5a7b24).
+func x25519Base(scalar []byte) ([]byte, error) {
+	pk, err := ecdh.X25519().NewPrivateKey(scalar)
+	if err != nil {
+		return nil, err
+	}
+	return pk.PublicKey().Bytes(), nil
 }
 
 var _ = fmt.Sprintf
