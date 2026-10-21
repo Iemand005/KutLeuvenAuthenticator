@@ -108,19 +108,19 @@ func main() {
 		"sha256-priv":  sha256sum(priv),
 		"sha256-srv":   sha256sum(serverPub),
 		"sha256-pub":   sha256sum(pub),
-		"hmac-priv":    hmacf("", priv, priv),
-		"hmac-shared":  hmacf("", shared, shared),
+		"hmac-priv":    hmacf(priv, priv),
+		"hmac-shared":  hmacf(shared, shared),
 	}
 	// pj8-style derived keys: SHA-512(block)[:32] for many block orders (2 and 3 parts).
 	parts := map[string][]byte{
 		"shared": shared, "priv": priv, "srv": serverPub, "pub": pub,
-		"salt": hmacf("curve25519", priv, priv), "salt2": hmacf("", priv, priv),
-		"saltSh": hmacf("", shared, shared),
+		"salt": hmacf(priv, priv), "salt2": hmacf(priv, priv),
+		"saltSh": hmacf(shared, shared),
 	}
 	for pn, p := range parts {
 		keys["sha512("+pn+")"] = sha512sum(p)[:32]
-		keys["hmac(priv,"+pn+")"] = hmacf("", priv, p)
-		keys["hmac("+pn+",priv)"] = hmacf("", p, priv)
+		keys["hmac(priv,"+pn+")"] = hmacf(priv, p)
+		keys["hmac("+pn+",priv)"] = hmacf(p, priv)
 	}
 	// 2-part and 3-part concatenations.
 	names := []string{"shared", "priv", "srv", "pub", "salt", "saltSh"}
@@ -199,7 +199,7 @@ func concat(bs ...[]byte) []byte {
 }
 func sha256sum(b []byte) []byte { s := sha256.Sum256(b); return s[:] }
 func sha512sum(b []byte) []byte { s := sha512.Sum512(b); return s[:] }
-func hmacf(_, key, msg []byte) []byte {
+func hmacf(key, msg []byte) []byte {
 	m := hmac.New(sha256.New, key)
 	m.Write(msg)
 	return m.Sum(nil)
