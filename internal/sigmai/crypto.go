@@ -132,7 +132,7 @@ func (c *Crypto) DeriveKey(peerPub []byte) ([]byte, error) {
 // Verified live against the mc endpoint: the server's first frame carries
 // sequence 1 and decrypts with nonce 00 00 00 01 followed by 20 zero bytes.
 func NonceFromSeq(seq uint64) []byte {
-	n := make([]byte, secretbox.NonceSize) // 24
+	n := make([]byte, NonceSize)
 	binary.BigEndian.PutUint32(n[:4], uint32(seq))
 	return n
 }
@@ -174,7 +174,11 @@ func Open(key, nonce, ciphertext, additionalData []byte) ([]byte, error) {
 }
 
 // NonceSize is the XSalsa20-Poly1305 nonce size (24).
-const NonceSize = secretbox.NonceSize
+const NonceSize = 24
 
 // KeySize is the XSalsa20-Poly1305 key size (32).
-const KeySize = secretbox.KeySize
+const KeySize = 32
+
+// TagSize is the Poly1305 authentication tag size (16). secretbox places the
+// tag in front of the ciphertext.
+const TagSize = secretbox.Overhead

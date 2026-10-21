@@ -1,22 +1,33 @@
 // Package session implements a sigmai session: key agreement over a WebSocket
-// and authenticated frame exchange.
+// and an encrypted frame channel.
 //
-// Frame cryptography:
-//   - each direction has its own 32-byte session key, derived via Crypto.DeriveKey
-//     (X25519 + HMAC-SHA256 salt + SHA-512 expand; see sigmai.Crypto).
-//   - the AEAD is XChaCha20-Poly1305 with a 24-byte nonce derived from the frame
-//     sequence number (sigmai.NonceFromSeq), not carried on the wire.
-//   - the receiver enforces monotonically increasing sequence numbers (replay
-//     protection; native 4EM @ 0x5f21fc).
+// # Cryptography
 //
-// NOTE: the exact handshake message sequence (which frame first carries the
-// ephemeral public key, and the pj8 role flag) is not yet byte-verified; see
-// DOCUMENTATION.md §8. PerformHandshake is the single place to finalise once a
-// capture is available.
+//   - The session key is derived once, during the handshake, with
+//     Crypto.DeriveKey: SHA-512(shared || client_pub || server_pub)[:32],
+//     where shared is the X25519 ECDH secret.
+//   - The AEAD is XSalsa20-Poly1305 in the NaCl "secretbox" layout (16-byte
+//     Poly1305 tag first, no associated data).
+//   - The 24-byte nonce is the frame sequence number in big-endian into the
+//     first 4 bytes, the remaining 20 bytes zero (sigmai.NonceFromSeq).
+//
+// # Framing
+//
+// After the handshake, every message is an outer frame of type 32 whose field 3
+// holds the sequence number and whose field 4 holds the encrypted inner
+// message (see sigmai.NewEncryptedFrame and the native builder n0M @ 0x5e99b0).
+//
+// Sequence numbers are allocated by the native code in _4UM @ 0x5f2438:
+//
+//	v5 = tx + 2
+//	role 0 (client): if v5 is odd -> v5 = tx + 3
+//	role 1 (server): if v5 is even -> v5 = tx + 1
+//
+// The client (role 0) therefore always sends even sequence numbers, starting
+// at 2, and only accepts odd, strictly increasing ones (native _4EM @ 0x5f21fc).
 package session
 
 import (
-	"encoding/binary"
 	"fmt"
 	"sync"
 
@@ -24,15 +35,24 @@ import (
 	"kut-leuven-authenticator/internal/transport"
 )
 
-// Session is an authenticated sigmai channel.
+// Role values used by the native key schedule and sequence allocator.
+const (
+	// RoleClient is the initiator (role 0): sends even sequence numbers.
+	RoleClient byte = 0
+	// RoleServer is the responder (role 1): sends odd sequence numbers.
+	RoleServer byte = 1
+)
+
+// Session is an encrypted sigmai channel.
 type Session struct {
 	conn *transport.Conn
 
-	sendKey []byte
-	recvKey []byte
+	key []byte
 
-	sendSeq uint64
-	recvSeq uint64
+	// txSeq is the last sequence number we sent (always even for a client).
+	txSeq uint64
+	// rxSeq is the last sequence number we accepted (always odd for a client).
+	rxSeq uint64
 
 	mu sync.Mutex
 }
@@ -42,75 +62,95 @@ func New(conn *transport.Conn) *Session {
 	return &Session{conn: conn}
 }
 
-// SendKey / RecvKey install the directional session keys (from the handshake).
-func (s *Session) SetKeys(send, recv []byte) {
-	s.sendKey = send
-	s.recvKey = recv
-}
-
-// SendFrame encrypts and writes a frame, using the next send sequence number.
-func (s *Session) SendFrame(f *sigmai.Frame) error {
+// SetKey installs the session key.
+func (s *Session) SetKey(key []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.key = append([]byte(nil), key...)
+}
 
-	seq := s.sendSeq
-	s.sendSeq++
+// Key returns the session key.
+func (s *Session) Key() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]byte(nil), s.key...)
+}
 
-	plaintext := f.Marshal()
-	nonce := sigmai.NonceFromSeq(seq)
-	ct, err := sigmai.Seal(s.sendKey, nonce, plaintext, nil)
+// NextTxSeq allocates the next send sequence number. A client always sends
+// even sequence numbers (native _4UM @ 0x5f2438, role 0 branch).
+func (s *Session) NextTxSeq() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seq := s.txSeq + 2
+	if seq&1 != 0 {
+		seq = s.txSeq + 3
+	}
+	s.txSeq = seq
+	return seq
+}
+
+// Send encrypts an inner message and writes it as a type-32 frame.
+func (s *Session) Send(inner *sigmai.Inner) error {
+	return s.SendBytes(inner.Marshal())
+}
+
+// SendBytes encrypts a raw plaintext and writes it as a type-32 frame.
+func (s *Session) SendBytes(plaintext []byte) error {
+	s.mu.Lock()
+	key := append([]byte(nil), s.key...)
+	s.mu.Unlock()
+	if len(key) == 0 {
+		return fmt.Errorf("sigmai: session key not established")
+	}
+
+	seq := s.NextTxSeq()
+	ct, err := sigmai.Seal(key, sigmai.NonceFromSeq(seq), plaintext, nil)
 	if err != nil {
 		return err
 	}
-
-	wire := encodeEnvelope(seq, ct)
-	return s.conn.WriteBinary(wire)
+	return s.conn.WriteBinary(sigmai.NewEncryptedFrame(seq, ct).Marshal())
 }
 
-// RecvFrame reads one WebSocket message, decrypts it, and returns the frame.
-// It enforces a strictly increasing receive sequence number.
-func (s *Session) RecvFrame() (*sigmai.Frame, error) {
+// Recv reads one WebSocket message, decrypts it and returns the inner message.
+// It enforces the native replay rules: the sequence number must be strictly
+// greater than the last accepted one and, for a client, odd.
+func (s *Session) Recv() (*sigmai.Inner, error) {
 	_, raw, err := s.conn.ReadMessage()
 	if err != nil {
 		return nil, err
 	}
-	seq, ct, err := decodeEnvelope(raw)
+	frame, err := sigmai.ParseFrame(raw)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("sigmai: parse frame: %w", err)
+	}
+	switch frame.Type {
+	case sigmai.TypeServerHello:
+		return nil, fmt.Errorf("sigmai: unexpected server hello (sequence %d)", frame.Sequence())
+	case sigmai.TypeEncrypted:
+	default:
+		return nil, fmt.Errorf("sigmai: unexpected frame type %d", frame.Type)
+	}
+
+	seq := frame.Sequence()
+	s.mu.Lock()
+	last := s.rxSeq
+	s.mu.Unlock()
+	if seq <= last {
+		return nil, fmt.Errorf("sigmai: replayed sequence %d (last %d)", seq, last)
+	}
+	if seq&1 == 0 {
+		return nil, fmt.Errorf("sigmai: sequence %d is not odd (client expects odd)", seq)
+	}
+
+	key := s.Key()
+	pt, err := sigmai.Open(key, sigmai.NonceFromSeq(seq), frame.F4, nil)
+	if err != nil {
+		return nil, fmt.Errorf("sigmai: decrypt sequence %d: %w", seq, err)
 	}
 
 	s.mu.Lock()
-	if seq <= s.recvSeq && s.recvSeq != 0 {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("sigmai: replayed sequence %d (last %d)", seq, s.recvSeq)
-	}
-	s.recvSeq = seq
+	s.rxSeq = seq
 	s.mu.Unlock()
 
-	nonce := sigmai.NonceFromSeq(seq)
-	pt, err := sigmai.Open(s.recvKey, nonce, ct, nil)
-	if err != nil {
-		return nil, err
-	}
-	return sigmai.ParseFrame(pt)
-}
-
-// encodeEnvelope wraps a sequence number and ciphertext into the on-wire
-// container. The native framing places the sequence number alongside the
-// ciphertext; the precise byte layout is finalised with a capture (see §8).
-//
-// Layout used here: [8-byte little-endian seq][ciphertext||tag].
-func encodeEnvelope(seq uint64, ct []byte) []byte {
-	out := make([]byte, 8+len(ct))
-	binary.LittleEndian.PutUint64(out[:8], seq)
-	copy(out[8:], ct)
-	return out
-}
-
-func decodeEnvelope(raw []byte) (uint64, []byte, error) {
-	if len(raw) < 8 {
-		return 0, nil, fmt.Errorf("sigmai: frame too short (%d bytes)", len(raw))
-	}
-	seq := binary.LittleEndian.Uint64(raw[:8])
-	return seq, raw[8:], nil
+	return sigmai.ParseInner(pt)
 }

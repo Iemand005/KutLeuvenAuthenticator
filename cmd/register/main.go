@@ -66,8 +66,9 @@ func main() {
 	log.Printf("handshake complete")
 	log.Printf("  ephemeral pub : %x", hs.EphemeralPub)
 	log.Printf("  server pub    : %x", hs.ServerPub)
-	log.Printf("  key(initiator): %x", hs.KeyInitiator)
-	log.Printf("  key(responder): %x", hs.KeyResponder)
+	log.Printf("  session key   : %x", hs.Key)
+	log.Printf("  sequence      : %d", hs.Sequence)
+	log.Printf("  hello payload : %x", hs.Inner.Payload())
 
 	// TODO(enrolment): send TYPE_PROCESSOR_HEADLESS_REGISTER with the QR payload
 	// material and drive TYPE_PROCESSOR_CONFIRM_NEW_ACCOUNT, then persist the

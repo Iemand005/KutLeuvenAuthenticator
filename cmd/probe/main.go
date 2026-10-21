@@ -70,7 +70,7 @@ func main() {
 			log.Fatalf("write: %v", err)
 		}
 	case *send == "typed33":
-		f := sigmai.NewTyped(sigmai.TypeHeader)
+		f := &sigmai.Frame{Type: sigmai.TypeHeader}
 		b := f.Marshal()
 		log.Printf("sending typed33 frame (%d bytes): %x", len(b), b)
 		if err := conn.WriteBinary(b); err != nil {
