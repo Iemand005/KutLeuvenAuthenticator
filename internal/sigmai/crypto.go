@@ -2,24 +2,27 @@ package sigmai
 
 import (
 	"crypto/ecdh"
-	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/sha512"
+	"encoding/binary"
 	"fmt"
 
-	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/nacl/secretbox"
 )
 
 // Crypto implements the sigmai key schedule and AEAD, mirroring the native
-// functions (all re-decompiled with IDA 9.4 / Hex-Rays):
+// functions (all re-decompiled with IDA 9.4 / Hex-Rays and confirmed against
+// the live server):
 //
-//	pj8  (0x5aaedc) : session key schedule -> X25519 + SHA-512 expansion
+//	pj8  (0x5aaedc) : session key schedule -> X25519 + SHA-512
 //	hj8  (0x5a7b24) : X25519 base mult (public key from private scalar)
 //	iCg  (0x48bf4c) : crypto/ecdh X25519 NewPrivateKey(scalar)   [NewPublicKey in iSg]
 //	iD8  (0x5a7d6c) : X25519 ECDH(priv, peerPub) -> shared secret
-//	sj8  (0x5ab4d4) : derive a 24-byte nonce from the frame sequence number
-//	oz8  (0x5aaa30) : XChaCha20-Poly1305 AEAD open  (nj8 = HChaCha20 subkey)
+//	sj8  (0x5ab4d4) : derive the 24-byte AEAD nonce from the frame sequence number
+//	mz8  (0x5a9644) : HSalsa20 (subkey derivation)
+//	nT8  (0x5aa384) : Salsa20 keystream
+//	kT8  (0x5a8574) : Poly1305 tag verification
+//	oz8  (0x5aaa30) : AEAD open (tag-first layout, no associated data)
 //	tD8  (0x5ab7dc) : thin wrapper -> oz8(key, nonce, ct)
 //	4EM  (0x5f21fc) : inbound frame handler: seq = field 3, ct = field 4
 //
@@ -33,9 +36,10 @@ import (
 //         role != 0 (server) : shared || peer_pub || my_pub
 //  5. key = SHA-512(block)[:32]
 //
-// Because the ordering makes both peers hash the SAME 96-byte block
-// (shared || client_pub || server_pub), the client only ever needs its own
-// private key and the peer's public key; role is implicit by who is calling.
+// The AEAD is XSalsa20-Poly1305 in NaCl "secretbox" layout: the 16-byte
+// Poly1305 tag comes FIRST, followed by the ciphertext. There is no associated
+// data. The 24-byte nonce is the sequence number encoded big-endian into the
+// leading 4 bytes of a 24-byte buffer, the remaining 20 bytes zero.
 type Crypto struct {
 	priv *ecdh.PrivateKey
 	role byte
@@ -97,6 +101,9 @@ func (c *Crypto) SharedSecret(peerPub []byte) ([]byte, error) {
 //	role != 0 (server): shared || peer_pub || my_pub
 //
 // No KDF seed is involved; the shared secret is X25519(priv, peerPub).
+//
+// Verified live: the client's first inbound frame (type 17) decrypts with this
+// key, XSalsa20-Poly1305, and a nonce holding the big-endian sequence number.
 func (c *Crypto) DeriveKey(peerPub []byte) ([]byte, error) {
 	shared, err := c.SharedSecret(peerPub)
 	if err != nil {
@@ -117,52 +124,57 @@ func (c *Crypto) DeriveKey(peerPub []byte) ([]byte, error) {
 	return sum[:32], nil
 }
 
-func hmacSHA256(key, msg []byte) []byte {
-	m := hmac.New(sha256.New, key)
-	m.Write(msg)
-	return m.Sum(nil)
-}
-
 // NonceFromSeq derives the 24-byte AEAD nonce from a frame sequence number
-// (sj8 @ 0x5ab4d4). The native code encodes the counter into a 24-byte buffer;
-// the low 16 bits of the sequence occupy the leading bytes. We emit the 8-byte
-// little-endian sequence followed by 16 zero bytes, which matches the observed
-// "counter at the front, rest zero" layout. The exact layout is validated
-// against a live handshake (see DOCUMENTATION §8).
+// (sj8 @ 0x5ab4d4). The native code writes the counter into a 24-byte buffer
+// with encoding/binary using the big-endian byte order, so the low 32 bits of
+// the sequence occupy the leading 4 bytes and the remaining 20 bytes are zero.
+//
+// Verified live against the mc endpoint: the server's first frame carries
+// sequence 1 and decrypts with nonce 00 00 00 01 followed by 20 zero bytes.
 func NonceFromSeq(seq uint64) []byte {
-	n := make([]byte, chacha20poly1305.NonceSizeX) // 24
-	for i := 0; i < 8 && i < len(n); i++ {
-		n[i] = byte(seq >> (8 * i))
-	}
+	n := make([]byte, secretbox.NonceSize) // 24
+	binary.BigEndian.PutUint32(n[:4], uint32(seq))
 	return n
 }
 
-// Seal encrypts plaintext with XChaCha20-Poly1305 using the given key and nonce.
+// Seal encrypts plaintext with XSalsa20-Poly1305, producing the NaCl
+// "secretbox" layout: the 16-byte Poly1305 tag first, then the ciphertext.
 func Seal(key, nonce, plaintext, additionalData []byte) ([]byte, error) {
-	aead, err := chacha20poly1305.NewX(key)
-	if err != nil {
-		return nil, err
+	var k [32]byte
+	if len(key) != 32 {
+		return nil, fmt.Errorf("sigmai: key must be 32 bytes, got %d", len(key))
 	}
-	return aead.Seal(nil, nonce, plaintext, additionalData), nil
+	copy(k[:], key)
+	var n [24]byte
+	if len(nonce) != 24 {
+		return nil, fmt.Errorf("sigmai: nonce must be 24 bytes, got %d", len(nonce))
+	}
+	copy(n[:], nonce)
+	return secretbox.Seal(nil, plaintext, &n, &k), nil
 }
 
-// Open decrypts ciphertext with XChaCha20-Poly1305.
+// Open decrypts ciphertext in the NaCl "secretbox" layout: the 16-byte
+// Poly1305 tag first, then the ciphertext.
 func Open(key, nonce, ciphertext, additionalData []byte) ([]byte, error) {
-	aead, err := chacha20poly1305.NewX(key)
-	if err != nil {
-		return nil, err
+	var k [32]byte
+	if len(key) != 32 {
+		return nil, fmt.Errorf("sigmai: key must be 32 bytes, got %d", len(key))
 	}
-	pt, err := aead.Open(nil, nonce, ciphertext, additionalData)
-	if err != nil {
-		return nil, fmt.Errorf("sigmai: ae failure: %w", err)
+	copy(k[:], key)
+	var n [24]byte
+	if len(nonce) != 24 {
+		return nil, fmt.Errorf("sigmai: nonce must be 24 bytes, got %d", len(nonce))
+	}
+	copy(n[:], nonce)
+	pt, ok := secretbox.Open(nil, ciphertext, &n, &k)
+	if !ok {
+		return nil, fmt.Errorf("sigmai: ae failure")
 	}
 	return pt, nil
 }
 
-// NonceSize is the XChaCha20-Poly1305 nonce size (24).
-const NonceSize = chacha20poly1305.NonceSizeX
+// NonceSize is the XSalsa20-Poly1305 nonce size (24).
+const NonceSize = secretbox.NonceSize
 
-// KeySize is the XChaCha20-Poly1305 key size (32).
-const KeySize = chacha20poly1305.KeySize
-
-var _ = hmac.New
+// KeySize is the XSalsa20-Poly1305 key size (32).
+const KeySize = secretbox.KeySize
