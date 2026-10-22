@@ -26,11 +26,13 @@ func main() {
 	url := flag.String("url", "wss://authenticator.icts.kuleuven.be/ns/sigmai", "endpoint")
 	wait := flag.Duration("wait", 30*time.Second, "how long to listen after the handshake")
 	sendMode := flag.String("send", "", "after the handshake send a message: 12309")
+	mode := flag.String("mode", "", "reg: send the type-64 enrolment hello instead of the type-16 handshake")
 	flag.Parse()
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
 	target := *url
 	var reg *qr.Registration
+	var qrPayload []byte
 	if *qrPath != "" {
 		codes, err := qr.DecodeFile(*qrPath)
 		if err != nil {
@@ -40,6 +42,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("qr parse: %v", err)
 		}
+		qrPayload = codes[0].Payload
 		log.Printf("QR %d bytes: %x", len(codes[0].Payload), codes[0].Payload)
 		log.Printf("registration: type=%d jacob=%d pac=%d ver=%d s6c=%d servers=%v",
 			reg.Type, reg.Jacob, reg.Pac, reg.Version, reg.S6c, reg.Servers)
@@ -60,6 +63,63 @@ func main() {
 	log.Printf("connected %s (subprotocol=%q)", target, conn.Subprotocol())
 
 	sess := session.New(conn)
+	if *mode == "reg3" {
+		if reg == nil {
+			log.Fatalf("mode=%s needs -qr", *mode)
+		}
+		if _, err := sess.HandshakeWithTimeout(20 * time.Second); err != nil {
+			log.Fatalf("handshake: %v", err)
+		}
+		hello := buildRegHello(reg, qrPayload)
+		log.Printf("sending encrypted type-64 hello (%d B): %x", len(hello), hello)
+		if err := sess.SendBytes(hello); err != nil {
+			log.Fatalf("send: %v", err)
+		}
+		deadline := time.Now().Add(*wait)
+		for {
+			if err := conn.SetReadDeadline(deadline); err != nil {
+				log.Fatalf("deadline: %v", err)
+			}
+			pt, err := sess.RecvPlaintext()
+			if err != nil {
+				log.Printf("recv: %v", err)
+				return
+			}
+			log.Printf("=== plaintext (%d B): %x", len(pt), pt)
+			dump("pt", pt, 0)
+			explainRegReply(reg, pt)
+		}
+	}
+	if *mode == "reg" || *mode == "reg2" {
+		if reg == nil {
+			log.Fatalf("mode=%s needs -qr", *mode)
+		}
+		if *mode == "reg2" {
+			if _, err := sess.HandshakeWithTimeout(20 * time.Second); err != nil {
+				log.Fatalf("handshake: %v", err)
+			}
+			log.Printf("handshake done; sending registration hello next")
+		}
+		hello := buildRegHello(reg, qrPayload)
+		log.Printf("sending type-64 registration hello (%d B): %x", len(hello), hello)
+		if err := conn.WriteBinary(hello); err != nil {
+			log.Fatalf("send reg hello: %v", err)
+		}
+		deadline := time.Now().Add(*wait)
+		for {
+			if err := conn.SetReadDeadline(deadline); err != nil {
+				log.Fatalf("deadline: %v", err)
+			}
+			_, raw, err := conn.ReadMessage()
+			if err != nil {
+				log.Printf("read: %v", err)
+				return
+			}
+			log.Printf("=== raw frame (%d B): %x", len(raw), raw)
+			dump("reply", raw, 0)
+			explainRegReply(reg, raw)
+		}
+	}
 	hs, err := sess.HandshakeWithTimeout(20 * time.Second)
 	if err != nil {
 		log.Fatalf("handshake: %v", err)
@@ -214,3 +274,5 @@ func printable(b []byte) string {
 	}
 	return string(b)
 }
+
+

@@ -111,6 +111,49 @@ func (s *Session) SendBytes(plaintext []byte) error {
 	return s.conn.WriteBinary(sigmai.NewEncryptedFrame(seq, ct).Marshal())
 }
 
+// RecvPlaintext reads one WebSocket message and returns the decrypted payload
+// without assuming it is an inner oUB envelope. Sequence-number replay rules
+// are enforced exactly as in Recv.
+func (s *Session) RecvPlaintext() ([]byte, error) {
+	_, raw, err := s.conn.ReadMessage()
+	if err != nil {
+		return nil, err
+	}
+	frame, err := sigmai.ParseFrame(raw)
+	if err != nil {
+		return nil, fmt.Errorf("sigmai: parse frame: %w", err)
+	}
+	switch frame.Type {
+	case sigmai.TypeServerHello:
+		return nil, fmt.Errorf("sigmai: unexpected server hello (sequence %d)", frame.Sequence())
+	case sigmai.TypeEncrypted:
+	default:
+		return nil, fmt.Errorf("sigmai: unexpected frame type %d", frame.Type)
+	}
+
+	seq := frame.Sequence()
+	s.mu.Lock()
+	last := s.rxSeq
+	s.mu.Unlock()
+	if seq <= last {
+		return nil, fmt.Errorf("sigmai: replayed sequence %d (last %d)", seq, last)
+	}
+	if seq&1 == 0 {
+		return nil, fmt.Errorf("sigmai: sequence %d is not odd (client expects odd)", seq)
+	}
+
+	key := s.Key()
+	pt, err := sigmai.Open(key, sigmai.NonceFromSeq(seq), frame.F4, nil)
+	if err != nil {
+		return nil, fmt.Errorf("sigmai: decrypt sequence %d: %w", seq, err)
+	}
+
+	s.mu.Lock()
+	s.rxSeq = seq
+	s.mu.Unlock()
+	return pt, nil
+}
+
 // Recv reads one WebSocket message, decrypts it and returns the inner message.
 // It enforces the native replay rules: the sequence number must be strictly
 // greater than the last accepted one and, for a client, odd.
