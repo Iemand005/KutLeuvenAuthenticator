@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 
 	"kut-leuven-authenticator/internal/wire"
@@ -22,9 +23,6 @@ func qrKeyCandidates(blobs map[string][]byte) []candidateKey {
 	var out []candidateKey
 	for i := 0; i < len(order); i++ {
 		for j := 0; j < len(order); j++ {
-			if i == j {
-				continue
-			}
 			a, b := blobs[order[i]], blobs[order[j]]
 			if len(a) != 16 || len(b) != 16 {
 				continue
@@ -32,10 +30,37 @@ func qrKeyCandidates(blobs map[string][]byte) []candidateKey {
 			k := make([]byte, 32)
 			copy(k, a)
 			copy(k[16:], b)
-			out = append(out, candidateKey{name: order[i] + "||" + order[j], key: k})
+			name := order[i] + "||" + order[j]
+			out = append(out, candidateKey{name: name, key: k})
 			s := sha256.Sum256(k)
-			out = append(out, candidateKey{name: "sha256(" + order[i] + "||" + order[j] + ")", key: s[:]})
+			out = append(out, candidateKey{name: "sha256(" + name + ")", key: s[:]})
+			for _, part := range [][]byte{a, b} {
+				h := sha256.Sum256(part)
+				out = append(out, candidateKey{name: "sha256(" + name + " part)", key: h[:]})
+			}
 		}
+	}
+	out = append(out, configKeyCandidates()...)
+	return out
+}
+
+// configKeyCandidates returns the 32-byte keys embedded in the app's
+// nextauth.json (sfs/mc service keys and both halves of field 100).
+func configKeyCandidates() []candidateKey {
+	hexKeys := []struct{ name, hex string }{
+		{"cfg.sfs.f2", "03b67efde8dda50f02edcba4eaf93ab42e6f590d2d1503b03cabc7cc92e8e0ab"},
+		{"cfg.mc.f2", "ad6181665d9894b6c42296dde81c9b935206f854c96d0d896f36f8760fa2a131"},
+		{"cfg.mc.f3", "6852f60b9107da8aaddbb3264c7bc7bc84ff1832d451b0cc6b8f1cd2add9f347"},
+		{"cfg.f100.lo", "d3bc94f0a577058c5b9106464807f9207409db948df7dfba197955bf5ab5d7b9"},
+		{"cfg.f100.hi", "c768dc8e0420f6e63785b10a8423e871e8746c934245ba1dd9ade7084cdb110c"},
+	}
+	var out []candidateKey
+	for _, hk := range hexKeys {
+		b, err := hex.DecodeString(hk.hex)
+		if err != nil || len(b) != 32 {
+			continue
+		}
+		out = append(out, candidateKey{name: hk.name, key: b})
 	}
 	return out
 }
@@ -59,13 +84,21 @@ func signedMessageCandidates(typ uint64, pub, pub2 []byte, epoch uint64) []signe
 		for _, p := range parts {
 			switch p[0] {
 			case 1:
-				m = wire.AppendUvarintField(m, 1, typ)
+				if typ != 0 {
+					m = wire.AppendUvarintField(m, 1, typ)
+				}
 			case 2:
-				m = wire.AppendBytes(m, 2, pub)
+				if len(pub) > 0 {
+					m = wire.AppendBytes(m, 2, pub)
+				}
 			case 3:
-				m = wire.AppendBytes(m, 3, pub2)
+				if len(pub2) > 0 {
+					m = wire.AppendBytes(m, 3, pub2)
+				}
 			case 4:
-				m = wire.AppendUvarintField(m, 4, epoch)
+				if epoch != 0 {
+					m = wire.AppendUvarintField(m, 4, epoch)
+				}
 			}
 		}
 		return m
@@ -81,9 +114,15 @@ func signedMessageCandidates(typ uint64, pub, pub2 []byte, epoch uint64) []signe
 	var eb [8]byte
 	binary.LittleEndian.PutUint64(eb[:], epoch)
 	var m []byte
-	m = wire.AppendUvarintField(m, 1, typ)
-	m = wire.AppendBytes(m, 2, pub)
-	m = wire.AppendBytes(m, 3, pub2)
+	if typ != 0 {
+		m = wire.AppendUvarintField(m, 1, typ)
+	}
+	if len(pub) > 0 {
+		m = wire.AppendBytes(m, 2, pub)
+	}
+	if len(pub2) > 0 {
+		m = wire.AppendBytes(m, 3, pub2)
+	}
 	m = wire.AppendBytes(m, 4, eb[:])
 	add("1,2,3,4bytes8le", m)
 
