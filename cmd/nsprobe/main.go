@@ -26,31 +26,43 @@ func main() {
 	url := flag.String("url", "wss://authenticator.icts.kuleuven.be/ns/sigmai", "endpoint")
 	wait := flag.Duration("wait", 30*time.Second, "how long to listen after the handshake")
 	sendMode := flag.String("send", "", "after the handshake send a message: 12309")
-	mode := flag.String("mode", "", "reg: send the type-64 enrolment hello instead of the type-16 handshake")
+	mode := flag.String("mode", "", "reg: send the type-64 enrolment hello; auth: send a 12309 approval for a login QR")
+	variant := flag.Int("variant", 1, "auth signing variant (1=structB, 2=4gB{12309,B}, 3=structA, 4=minimal B)")
+	seed := flag.String("seed", "", "auth: comma-separated 32-byte hex Ed25519 seeds (default: random)")
+	tsMode := flag.String("ts", "now", "auth timestamp source: now or qr")
 	flag.Parse()
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
 	target := *url
 	var reg *qr.Registration
+	var login *qr.Login
 	var qrPayload []byte
 	if *qrPath != "" {
 		codes, err := qr.DecodeFile(*qrPath)
 		if err != nil {
 			log.Fatalf("qr: %v", err)
 		}
-		reg, err = qr.ParseRegistration(codes[0].Payload)
-		if err != nil {
-			log.Fatalf("qr parse: %v", err)
-		}
 		qrPayload = codes[0].Payload
 		log.Printf("QR %d bytes: %x", len(codes[0].Payload), codes[0].Payload)
-		log.Printf("registration: type=%d jacob=%d pac=%d ver=%d s6c=%d servers=%v",
-			reg.Type, reg.Jacob, reg.Pac, reg.Version, reg.S6c, reg.Servers)
 		dump("qr", codes[0].Payload, 0)
-		if u := reg.ServerURL(); u != "" {
-			log.Printf("QR server URL: %s", u)
-			if *url == "wss://authenticator.icts.kuleuven.be/ns/sigmai" {
-				target = u
+
+		if l, err := qr.ParseLogin(qrPayload); err == nil && l.IsLogin() {
+			login = l
+			log.Printf("login QR: type=%d jacob=%d pac=%d ver=%d ts=%d (%s) nonce=%x",
+				l.Type, l.Jacob, l.Pac, l.Version, l.Timestamp, l.Created().UTC(), l.Nonce)
+			log.Printf("login QR: register=%s server=%s", l.RegisterID(), l.ServerID())
+		} else {
+			reg, err = qr.ParseRegistration(qrPayload)
+			if err != nil {
+				log.Fatalf("qr parse: %v", err)
+			}
+			log.Printf("registration: type=%d jacob=%d pac=%d ver=%d s6c=%d servers=%v",
+				reg.Type, reg.Jacob, reg.Pac, reg.Version, reg.S6c, reg.Servers)
+			if u := reg.ServerURL(); u != "" {
+				log.Printf("QR server URL: %s", u)
+				if *url == "wss://authenticator.icts.kuleuven.be/ns/sigmai" {
+					target = u
+				}
 			}
 		}
 	}
@@ -130,6 +142,15 @@ func main() {
 	for _, n := range hs.Inner.Nested {
 		if n.Varint == 12308 && len(n.Repeated) > 0 && len(n.Repeated[0]) == 64 {
 			explain12308(reg, hs, n)
+		}
+	}
+
+	if *mode == "auth" {
+		if login == nil {
+			log.Fatalf("mode=auth needs a login QR (-qr)")
+		}
+		if err := sendAuth(sess, hs, login, *variant, *seed, *tsMode == "qr"); err != nil {
+			log.Fatalf("auth send: %v", err)
 		}
 	}
 
