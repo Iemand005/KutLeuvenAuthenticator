@@ -3,6 +3,8 @@ package main
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
 	"fmt"
 	"log"
@@ -24,13 +26,55 @@ type authKeys struct {
 	priv2      ed25519.PrivateKey
 }
 
-// parseSeeds accepts one or two comma-separated 32-byte hex seeds. When no
-// seeds are given, two random keypairs are generated.
-func parseSeeds(s string) (*authKeys, error) {
+// deriveSeed resolves symbolic seed tokens against the QR material.
+//
+//	qr0/qr1/qr2   SHA-512(login QR f6)[0:32], [16:48], [32:64]
+//	qr3           SHA-256(login QR f6)
+//	qrn0          SHA-512(login QR f13 nonce)[0:32]
+//	reg0/reg1/2   SHA-512(registration QR f6)[0:32], [16:48], [32:64]
+//	reg3          SHA-256(registration QR f6)
+func deriveSeed(tok string, login *qr.Login, regSecret []byte) ([]byte, bool) {
+	var src []byte
+	switch tok {
+	case "qr0", "qr1", "qr2", "qr3":
+		src = login.Register
+	case "qrn0":
+		src = login.Nonce
+	case "reg0", "reg1", "reg2", "reg3":
+		src = regSecret
+	default:
+		return nil, false
+	}
+	if len(src) == 0 {
+		return nil, false
+	}
+	if tok == "qr3" || tok == "reg3" {
+		h := sha256.Sum256(src)
+		return h[:], true
+	}
+	h := sha512.Sum512(src)
+	switch tok {
+	case "qr1", "reg1":
+		return h[16:48], true
+	case "qr2", "reg2":
+		return h[32:64], true
+	default:
+		return h[0:32], true
+	}
+}
+
+// parseSeeds accepts one or two comma-separated tokens: 64 hex chars or a
+// symbolic derivation (see deriveSeed). When no seeds are given, two random
+// keypairs are generated.
+func parseSeeds(s string, login *qr.Login, regSecret []byte) (*authKeys, error) {
 	var seeds [][]byte
 	for _, part := range strings.Split(s, ",") {
 		part = strings.TrimSpace(part)
 		if part == "" {
+			continue
+		}
+		if b, ok := deriveSeed(part, login, regSecret); ok {
+			seeds = append(seeds, b)
 			continue
 		}
 		b, err := hex.DecodeString(part)
@@ -122,8 +166,8 @@ func buildStructA(structB []byte, ts uint64) []byte {
 //	f1 varint   12309
 //	f2 bytes    skA(struct B)
 //	f3 repeated signatures over tEA(struct A)
-func sendAuth(sess *session.Session, hs *session.HandshakeResult, login *qr.Login, variant int, seedSpec string, useQRTime bool) error {
-	k, err := parseSeeds(seedSpec)
+func sendAuth(sess *session.Session, hs *session.HandshakeResult, login *qr.Login, variant int, seedSpec string, regSecret []byte, useQRTime bool) error {
+	k, err := parseSeeds(seedSpec, login, regSecret)
 	if err != nil {
 		return err
 	}

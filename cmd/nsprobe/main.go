@@ -28,10 +28,25 @@ func main() {
 	sendMode := flag.String("send", "", "after the handshake send a message: 12309")
 	mode := flag.String("mode", "", "reg: send the type-64 enrolment hello; auth: send a 12309 approval for a login QR")
 	variant := flag.Int("variant", 1, "auth signing variant (1=structB, 2=4gB{12309,B}, 3=structA, 4=minimal B)")
-	seed := flag.String("seed", "", "auth: comma-separated 32-byte hex Ed25519 seeds (default: random)")
+	seed := flag.String("seed", "", "auth: seeds — 64 hex chars, or qr0/qr1/qr2/qr3 (login QR f6) / qrn0 (nonce) / reg0..3 (-regqr f6)")
+	regQRPath := flag.String("regqr", "", "auth: registration QR PNG whose f6 is the device secret (for regN seeds)")
 	tsMode := flag.String("ts", "now", "auth timestamp source: now or qr")
 	flag.Parse()
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
+
+	var regSecret []byte
+	if *regQRPath != "" {
+		codes, err := qr.DecodeFile(*regQRPath)
+		if err != nil {
+			log.Fatalf("regqr: %v", err)
+		}
+		l, err := qr.ParseLogin(codes[0].Payload)
+		if err != nil {
+			log.Fatalf("regqr parse: %v", err)
+		}
+		regSecret = l.Register
+		log.Printf("regqr secret(%d)=%x", len(regSecret), regSecret)
+	}
 
 	target := *url
 	var reg *qr.Registration
@@ -149,7 +164,7 @@ func main() {
 		if login == nil {
 			log.Fatalf("mode=auth needs a login QR (-qr)")
 		}
-		if err := sendAuth(sess, hs, login, *variant, *seed, *tsMode == "qr"); err != nil {
+		if err := sendAuth(sess, hs, login, *variant, *seed, regSecret, *tsMode == "qr"); err != nil {
 			log.Fatalf("auth send: %v", err)
 		}
 	}

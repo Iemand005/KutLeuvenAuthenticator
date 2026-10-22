@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -28,6 +29,7 @@ func main() {
 	url := flag.String("url", "wss://authenticator-wss.icts.kuleuven.be/", "browser websocket endpoint")
 	origin := flag.String("origin", "https://idp.kuleuven.be", "Origin header")
 	wait := flag.Duration("wait", 5*time.Minute, "how long to listen")
+	send := flag.String("send", "", "extra client lines to send after 1.5s, ';'-separated ({reg}/{srv} substituted)")
 	flag.Parse()
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
@@ -66,6 +68,22 @@ func main() {
 		log.Fatalf("write REGISTER: %v", err)
 	}
 	log.Printf("-> %s", msg)
+
+	if *send != "" {
+		go func() {
+			time.Sleep(1500 * time.Millisecond)
+			for _, line := range strings.Split(*send, ";") {
+				line = strings.ReplaceAll(line, "{reg}", *register)
+				line = strings.ReplaceAll(line, "{srv}", *server)
+				if err := conn.WriteMessage(websocket.TextMessage, []byte(line)); err != nil {
+					log.Printf("write %q: %v", line, err)
+					return
+				}
+				log.Printf("-> %s", line)
+				time.Sleep(500 * time.Millisecond)
+			}
+		}()
+	}
 
 	deadline := time.Now().Add(*wait)
 	for {
